@@ -1,138 +1,123 @@
-from flask import Flask, render_template, redirect, request, abort
-from flask_login import LoginManager, login_user, login_required, logout_user, current_user
+# импортируем библиотеки
+from flask import Flask, request
+import logging
 
-from forms.news import NewsForm
-from forms.user import RegisterForm, LoginForm
-from data.news import News
-from data.users import User
-from data import db_session
+# библиотека, которая нам понадобится для работы с JSON
+import json
 
+# создаем приложение
+# мы передаем __name__, в нем содержится информация, в каком модуле мы находимся.
+# В данном случае там содержится '__main__', так как мы обращаемся к переменной из запущенного модуля.
+# если бы такое обращение, например, произошло внутри модуля logging, то мы бы получили 'logging'
 app = Flask(__name__)
-login_manager = LoginManager()
-login_manager.init_app(app)
-app.config['SECRET_KEY'] = 'yandexlyceum_secret_key'
+
+# Устанавливаем уровень логирования
+logging.basicConfig(level=logging.INFO)
+
+# Создадим словарь, чтобы для каждой сессии общения с навыком хранились подсказки, которые видел пользователь.
+# Это поможет нам немного разнообразить подсказки ответов (buttons в JSON ответа).
+# Когда новый пользователь напишет нашему навыку, то мы сохраним в этот словарь запись формата
+# sessionStorage[user_id] = { 'suggests': ["Не хочу.", "Не буду.", "Отстань!" ] }
+# Такая запись говорит, что мы показали пользователю эти три подсказки. Когда он откажется купить слона,
+# то мы уберем одну подсказку. Как будто что-то меняется :)
+sessionStorage = {}
 
 
-@login_manager.user_loader
-def load_user(user_id):
-    db_sess = db_session.create_session()
-    return db_sess.query(User).get(user_id)
-
-
-@app.route('/logout')
-@login_required
-def logout():
-    logout_user()
-    return redirect("/")
-
-
+@app.route('/post', methods=['POST'])
+# Функция получает тело запроса и возвращает ответ.
+# Внутри функции доступен request.json - это JSON, который отправила нам Алиса в запросе POST
 def main():
-    db_session.global_init("db/blogs.db")
-    app.run("0.0.0.0")
+    logging.info('Request: %r', request.json)
+
+    # Начинаем формировать ответ, согласно документации
+    # мы собираем словарь, который потом при помощи библиотеки json преобразуем в JSON и отдадим Алисе
+    response = {
+        'session': request.json['session'],
+        'version': request.json['version'],
+        'response': {
+            'end_session': False
+        }
+    }
+
+    # Отправляем request.json и response в функцию handle_dialog. Она сформирует оставшиеся поля JSON, которые отвечают
+    # непосредственно за ведение диалога
+    handle_dialog(request.json, response)
+
+    logging.info('Response: %r', request.json)
+
+    # Преобразовываем в JSON и возвращаем
+    return json.dumps(response)
 
 
-@app.route('/news', methods=['GET', 'POST'])
-@login_required
-def add_news():
-    form = NewsForm()
-    if form.validate_on_submit():
-        db_sess = db_session.create_session()
-        news = News()
-        news.title = form.title.data
-        news.content = form.content.data
-        news.is_private = form.is_private.data
-        current_user.news.append(news)
-        db_sess.merge(current_user)
-        db_sess.commit()
-        return redirect('/')
-    return render_template('news.html', title='Добавление новости', form=form)
+def handle_dialog(req, res):
+    user_id = req['session']['user_id']
+
+    if req['session']['new']:
+        # Это новый пользователь.
+        # Инициализируем сессию и поприветствуем его.
+        # Запишем подсказки, которые мы ему покажем в первый раз
+
+        sessionStorage[user_id] = {
+            'suggests': [
+                "Не хочу.",
+                "Не буду.",
+                "Отстань!",
+            ]
+        }
+        # Заполняем текст ответа
+        res['response']['text'] = 'Привет! Купи слона!'
+        # Получим подсказки
+        res['response']['buttons'] = get_suggests(user_id)
+        return
+
+    # Сюда дойдем только, если пользователь не новый, и разговор с Алисой уже был начат
+    # Обрабатываем ответ пользователя.
+    # В req['request']['original_utterance'] лежит весь текст, что нам прислал пользователь
+    # Если он написал 'ладно', 'куплю', 'покупаю', 'хорошо', то мы считаем, что пользователь не согласился.
+    # Подумайте, все ли в этом фрагменте написано "красиво"?
+    if req['request']['original_utterance'].lower() in [
+        'ладно',
+        'куплю',
+        'покупаю',
+        'хорошо'
+    ]:
+        # Пользователь согласился, прощаемся.
+        res['response']['text'] = 'Слона можно найти на Яндекс.Маркете!'
+        res['response']['end_session'] = True
+        return
+
+    # Если нет, то убеждаем его купить слона!
+    res['response']['text'] = 'Все говорят "%s", а ты купи слона!' % (
+        req['request']['original_utterance']
+    )
+    res['response']['buttons'] = get_suggests(user_id)
 
 
-@app.route('/news_delete/<int:id>', methods=['GET', 'POST'])
-@login_required
-def news_delete(id):
-    db_sess = db_session.create_session()
-    news = db_sess.query(News).filter(News.id == id, News.user == current_user).first()
-    if news:
-        db_sess.delete(news)
-        db_sess.commit()
-    else:
-        abort(404)
-    return redirect('/')
+# Функция возвращает две подсказки для ответа.
+def get_suggests(user_id):
+    session = sessionStorage[user_id]
 
+    # Выбираем две первые подсказки из массива.
+    suggests = [
+        {'title': suggest, 'hide': True}
+        for suggest in session['suggests'][:2]
+    ]
 
-@app.route('/news/<int:id>', methods=['GET', 'POST'])
-@login_required
-def edit_news(id):
-    form = NewsForm()
-    if request.method == "GET":
-        db_sess = db_session.create_session()
-        news = db_sess.query(News).filter(News.id == id, News.user == current_user).first()
-        if news:
-            form.title.data = news.title
-            form.content.data = news.content
-            form.is_private.data = news.is_private
-        else:
-            abort(404)
-    if form.validate_on_submit():
-        db_sess = db_session.create_session()
-        news = db_sess.query(News).filter(News.id == id, News.user == current_user).first()
-        if news:
-            news.title = form.title.data
-            news.content = form.content.data
-            news.is_private = form.is_private.data
-            db_sess.commit()
-            return redirect('/')
-        else:
-            abort(404)
-    return render_template('news.html', title='Редактирование новости', form=form)
+    # Убираем первую подсказку, чтобы подсказки менялись каждый раз.
+    session['suggests'] = session['suggests'][1:]
+    sessionStorage[user_id] = session
 
+    # Если осталась только одна подсказка, предлагаем подсказку
+    # со ссылкой на Яндекс.Маркет.
+    if len(suggests) < 2:
+        suggests.append({
+            "title": "Ладно",
+            "url": "https://market.yandex.ru/search?text=слон",
+            "hide": True
+        })
 
-@app.route("/")
-def index():
-    db_sess = db_session.create_session()
-    if current_user.is_authenticated:
-        news = db_sess.query(News).filter((News.user == current_user) | (News.is_private != True))
-    else:
-        news = db_sess.query(News).filter(News.is_private != True)
-    return render_template("index.html", news=news)
-
-
-@app.route('/register', methods=['GET', 'POST'])
-def reqister():
-    form = RegisterForm()
-    if form.validate_on_submit():
-        if form.password.data != form.password_again.data:
-            return render_template('register.html', title='Регистрация', form=form,
-                                   message="Пароли не совпадают")
-        db_sess = db_session.create_session()
-        if db_sess.query(User).filter(User.email == form.email.data).first():
-            return render_template('register.html', title='Регистрация', form=form,
-                                   message="Такой пользователь уже есть")
-        user = User(
-            name=form.name.data,
-            email=form.email.data,
-            about=form.about.data
-        )
-        user.set_password(form.password.data)
-        db_sess.add(user)
-        db_sess.commit()
-        return redirect('/login')
-    return render_template('register.html', title='Регистрация', form=form)
-
-
-@app.route('/login', methods=['GET', 'POST'])
-def login():
-    form = LoginForm()
-    if form.validate_on_submit():
-        db_sess = db_session.create_session()
-        user = db_sess.query(User).filter(User.email == form.email.data).first()
-        if user and user.check_password(form.password.data):
-            login_user(user, remember=form.remember_me.data)
-            return redirect("/")
-        return render_template('login.html', message="Неправильный логин или пароль", form=form)
-    return render_template('login.html', title='Авторизация', form=form)
+    return suggests
 
 
 if __name__ == '__main__':
-    main()
+    app.run("0.0.0.0")
